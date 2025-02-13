@@ -1154,6 +1154,12 @@ def process_crashes(crashes: List[Crash], context: Context,
                 f'{group.crashes[0].crash_state}')
       continue
 
+    # TODO: It needs to be ensured that `issue_metadata` is populated as a
+    # string where `context` is populated. Adding a quick fix for smooth
+    # fuzzing process. This should be removed when the above is implemented.
+    context.fuzzer_metadata['issue_metadata'] = str(
+        context.fuzzer_metadata['issue_metadata'])
+
     group_proto = uworker_msg_pb2.FuzzTaskCrashGroup(
         context=uworker_msg_pb2.FuzzContext(
             redzone=context.redzone,
