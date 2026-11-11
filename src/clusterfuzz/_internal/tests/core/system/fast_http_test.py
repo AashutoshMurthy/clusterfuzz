@@ -23,8 +23,10 @@ import socket
 import tempfile
 import threading
 import unittest
+from unittest import mock
 
 import aiohttp
+import google.api_core.exceptions
 
 from clusterfuzz._internal.system import fast_http
 from clusterfuzz._internal.tests.test_libs import helpers
@@ -121,3 +123,117 @@ class ErrorTolerantDownloadTest(unittest.TestCase):
       self.mock.warning.assert_called_with(f'Failed to download {url}.')
 
     asyncio.run(run_test())
+
+
+class DownloadUrlsBatchingTest(unittest.TestCase):
+  """Tests for batch partitioning in download_urls."""
+
+  def setUp(self):
+    helpers.patch(self, [
+        'clusterfuzz._internal.base.concurrency.make_pool',
+        'clusterfuzz._internal.base.utils.python_gc',
+    ])
+
+  def test_empty_urls(self):
+    """Empty input returns [] without creating a pool."""
+    self.assertEqual(fast_http.download_urls([]), [])
+    self.mock.make_pool.assert_not_called()
+
+  def test_partitions_across_workers_when_larger_than_pool(self):
+    """URLs are split across POOL_SIZE batches instead of a single batch."""
+    dispatched_batches = []
+
+    mock_pool = mock.MagicMock()
+    mock_pool.__enter__.return_value = mock_pool
+
+    def fake_map(func, batches):
+      del func
+      dispatched_batches.extend(batches)
+      return [[True] * len(batch) for batch in batches]
+
+    mock_pool.map.side_effect = fake_map
+    self.mock.make_pool.return_value = mock_pool
+
+    urls_and_paths = [
+        (f'http://example.com/{i}', f'/tmp/{i}') for i in range(10)
+    ]
+    with mock.patch.object(fast_http.concurrency, 'POOL_SIZE', 4):
+      results = fast_http.download_urls(urls_and_paths)
+
+    self.assertEqual(results, [True] * 10)
+    # 10 items across 4 workers -> ceiling(10 / 4) = 3 items per batch -> [3, 3, 3, 1].
+    self.assertEqual([len(b) for b in dispatched_batches], [3, 3, 3, 1])
+
+  def test_smaller_than_pool_size(self):
+    """Inputs smaller than POOL_SIZE use batch_size=1 without range() error."""
+    dispatched_batches = []
+
+    mock_pool = mock.MagicMock()
+    mock_pool.__enter__.return_value = mock_pool
+
+    def fake_map(func, batches):
+      del func
+      dispatched_batches.extend(batches)
+      return [[True] * len(batch) for batch in batches]
+
+    mock_pool.map.side_effect = fake_map
+    self.mock.make_pool.return_value = mock_pool
+
+    urls_and_paths = [(f'http://example.com/{i}', f'/tmp/{i}') for i in range(3)
+                     ]
+    with mock.patch.object(fast_http.concurrency, 'POOL_SIZE', 8):
+      results = fast_http.download_urls(urls_and_paths)
+
+    self.assertEqual(results, [True] * 3)
+    self.assertEqual([len(b) for b in dispatched_batches], [1, 1, 1])
+
+
+class DeleteBlobAsyncTest(unittest.TestCase):
+  """Tests for delete_blob_async."""
+
+  def setUp(self):
+    helpers.patch(self, [
+        'clusterfuzz._internal.metrics.logs.info',
+        'clusterfuzz._internal.metrics.logs.error',
+    ])
+
+  def test_http_404_logs_info_not_error(self):
+    """HTTP 404 response from aiohttp logs info instead of an error."""
+    mock_response = mock.MagicMock()
+    mock_response.status = 404
+
+    async def fake_text():
+      return 'No such object'
+
+    mock_response.text = fake_text
+    mock_ctx = mock.MagicMock()
+
+    async def fake_aenter(*_):
+      return mock_response
+
+    async def fake_aexit(*_):
+      return None
+
+    mock_ctx.__aenter__ = fake_aenter
+    mock_ctx.__aexit__ = fake_aexit
+
+    mock_session = mock.MagicMock()
+    mock_session.delete.return_value = mock_ctx
+
+    asyncio.run(
+        fast_http.delete_blob_async('bucket', 'blob/name', mock_session, 'tok'))
+
+    self.mock.info.assert_called_once_with(
+        'Not found: blob/name No such object.')
+    self.mock.error.assert_not_called()
+
+  def test_not_found_does_not_raise_unbound_local_error(self):
+    """NotFound exception logs cleanly without referencing unbound response_text."""
+    mock_session = mock.MagicMock()
+    mock_session.delete.side_effect = google.api_core.exceptions.NotFound('404')
+
+    asyncio.run(
+        fast_http.delete_blob_async('bucket', 'blob/name', mock_session, 'tok'))
+
+    self.mock.info.assert_called_once_with('Not found: blob/name.')
+    self.mock.error.assert_not_called()

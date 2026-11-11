@@ -19,6 +19,7 @@ from concurrent import futures
 import copy
 import datetime
 import io
+import itertools
 import json
 import os
 import pathlib
@@ -460,7 +461,7 @@ class GcsProvider(StorageProvider):
 
   def upload_signed_url(self, data_or_fileobj, signed_url: str) -> bool:
     """Uploads |data| to |signed_url|."""
-    requests.put(
+    _http_session().put(
         signed_url, data=data_or_fileobj,
         timeout=HTTP_TIMEOUT_SECONDS).raise_for_status()
     return True
@@ -472,7 +473,8 @@ class GcsProvider(StorageProvider):
 
   def delete_signed_url(self, signed_url):
     """Makes a DELETE HTTP request to |signed_url|."""
-    requests.delete(signed_url, timeout=HTTP_TIMEOUT_SECONDS).raise_for_status()
+    _http_session().delete(
+        signed_url, timeout=HTTP_TIMEOUT_SECONDS).raise_for_status()
 
 
 def _sign_url(remote_path: str,
@@ -826,6 +828,13 @@ def _signing_creds():
     _new_signing_creds()
 
   return _local.signing_creds
+
+
+def _http_session():
+  """Get a thread-local requests.Session for HTTP connection reuse."""
+  if not hasattr(_local, 'http_session'):
+    _local.http_session = requests.Session()
+  return _local.http_session
 
 
 def get_bucket_name_and_path(cloud_storage_file_path):
@@ -1269,7 +1278,7 @@ def _download_url(url):
   """Downloads |url| and returns the contents."""
   if _integration_test_env_doesnt_support_signed_urls():
     return read_data(url)
-  response = requests.get(url, timeout=HTTP_TIMEOUT_SECONDS)
+  response = _http_session().get(url, timeout=HTTP_TIMEOUT_SECONDS)
   if not response.ok:
     try:
       element_tree = ET.fromstring(response.text)
@@ -1292,6 +1301,8 @@ def _download_url(url):
     function='google_cloud_utils.storage.upload_signed_url')
 def upload_signed_url(data_or_fileobj, url: str) -> bool:
   """Uploads data to the |signed_url|."""
+  if hasattr(data_or_fileobj, 'seek'):
+    data_or_fileobj.seek(0)
   return _provider().upload_signed_url(str_to_bytes(data_or_fileobj), url)
 
 
@@ -1647,15 +1658,22 @@ def get_arbitrary_signed_upload_url(remote_directory):
       get_arbitrary_signed_upload_urls(remote_directory, num_uploads=1))[0]
 
 
+_PARALLEL_MAP_MAX_IN_FLIGHT = 1000
+
+
 def parallel_map(func, argument_list):
   """Wrapper around pool.map so we don't do it on OSS-Fuzz hosts which
   will OOM."""
   max_pool_size = 2
   timeout = 120
+  iterator = iter(argument_list)
   with concurrency.make_pool(max_pool_size=max_pool_size) as pool:
-    calls = [pool.submit(func, argument) for argument in argument_list]
+    calls = {
+        pool.submit(func, argument)
+        for argument in itertools.islice(iterator, _PARALLEL_MAP_MAX_IN_FLIGHT)
+    }
     while calls:
-      finished_calls, _ = futures.wait(
+      finished_calls, calls = futures.wait(
           calls, timeout=timeout, return_when=futures.FIRST_COMPLETED)
       if not finished_calls:
         logs.error('No call completed.')
@@ -1663,8 +1681,9 @@ def parallel_map(func, argument_list):
           call.cancel()
         raise TimeoutError(f'Nothing completed within {timeout} seconds')
       for finished_call in finished_calls:
-        calls.remove(finished_call)
         yield finished_call.result(timeout=timeout)
+      for argument in itertools.islice(iterator, len(finished_calls)):
+        calls.add(pool.submit(func, argument))
 
 
 def get_arbitrary_signed_upload_urls(remote_directory: str, num_uploads: int):

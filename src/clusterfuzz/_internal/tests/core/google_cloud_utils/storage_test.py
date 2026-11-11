@@ -13,6 +13,7 @@
 # limitations under the License.
 """Storage tests."""
 import datetime
+import io
 import os
 import unittest
 from unittest import mock
@@ -659,3 +660,78 @@ class GetRelativePathFromSignedUrlTest(unittest.TestCase):
           storage._get_relative_path_from_signed_url(  # pylint: disable=protected-access
               url, 'gs://b')
         self.assertNotIn('X-Goog-Signature', str(ctx.exception))
+
+
+class ParallelMapAndUploadRetryTest(unittest.TestCase):
+  """Tests for bounded parallel_map and file-handle rewind on upload retry."""
+
+  def test_parallel_map_bounded_in_flight(self):
+    """parallel_map yields all results while bounding in-flight futures."""
+    active_submissions = 0
+    max_active_submissions = 0
+
+    class TrackingPool:
+      """Pool wrapper that tracks concurrent in-flight futures."""
+
+      def __init__(self, inner_pool):
+        self._inner = inner_pool
+        self._executor = None
+
+      def __enter__(self):
+        self._executor = self._inner.__enter__()
+        return self
+
+      def __exit__(self, *args):
+        return self._inner.__exit__(*args)
+
+      def submit(self, fn, arg):
+        """Submit task to inner executor while tracking active count."""
+        nonlocal active_submissions, max_active_submissions
+        active_submissions += 1
+        max_active_submissions = max(max_active_submissions, active_submissions)
+        fut = self._executor.submit(fn, arg)
+
+        def _on_done(_):
+          nonlocal active_submissions
+          active_submissions -= 1
+
+        fut.add_done_callback(_on_done)
+        return fut
+
+    real_make_pool = storage.concurrency.make_pool
+
+    @mock.patch.object(storage, '_PARALLEL_MAP_MAX_IN_FLIGHT', 5)
+    def run():
+      with mock.patch.object(
+          storage.concurrency,
+          'make_pool',
+          side_effect=lambda **kw: TrackingPool(real_make_pool(**kw))):
+        results = list(storage.parallel_map(lambda x: x * 2, range(25)))
+      self.assertCountEqual(results, [x * 2 for x in range(25)])
+      self.assertLessEqual(max_active_submissions, 5)
+
+    run()
+
+  def test_upload_signed_url_rewinds_fileobj_on_retry(self):
+    """upload_signed_url seeks file-like objects back to 0 before each attempt."""
+    payload = b'corpus-backup-bytes'
+    fileobj = io.BytesIO(payload)
+    attempts = []
+
+    class FakeProvider:
+      """Fake storage provider that fails on the first upload attempt."""
+
+      def upload_signed_url(self, data_or_fileobj, signed_url):
+        """Read from stream and fail on first call."""
+        del signed_url
+        chunk = data_or_fileobj.read()
+        attempts.append(chunk)
+        if len(attempts) == 1:
+          raise ConnectionError('transient failure after reading stream')
+        return True
+
+    with mock.patch.object(storage, '_provider', return_value=FakeProvider()), \
+         mock.patch('time.sleep'):
+      self.assertTrue(storage.upload_signed_url(fileobj, 'https://example/u'))
+
+    self.assertEqual(attempts, [payload, payload])

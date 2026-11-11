@@ -344,12 +344,22 @@ class CorpusBackupTest(fake_filesystem_unittest.TestCase):
 
   def test_backup_corpus(self):
     """Test backup_corpus."""
+    uploaded_payloads = []
+
+    def capture_upload(data_or_fileobj, url):
+      self.assertFalse(isinstance(data_or_fileobj, bytes))
+      uploaded_payloads.append((data_or_fileobj.read(), url))
+      return True
+
+    self.mock.upload_signed_url.side_effect = capture_upload
     libfuzzer_corpus = corpus_manager.FuzzTargetCorpus('libFuzzer', 'fuzzer')
 
-    corpus_manager.backup_corpus('signed_upload_url', libfuzzer_corpus, '/dir')
+    self.assertTrue(
+        corpus_manager.backup_corpus('signed_upload_url', libfuzzer_corpus,
+                                     '/dir'))
 
-    self.mock.upload_signed_url.assert_has_calls(
-        [mock.call(b'archive contents...', 'signed_upload_url')])
+    self.assertEqual(uploaded_payloads,
+                     [(b'archive contents...', 'signed_upload_url')])
 
 
 class FileMixin:

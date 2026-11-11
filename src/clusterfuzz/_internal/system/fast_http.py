@@ -38,9 +38,10 @@ def download_urls(urls_and_filepaths: List[Tuple[str, str]]) -> List[bool]:
     return []
   batches = []
 
-  batch_size = len(urls_and_filepaths) // concurrency.POOL_SIZE
-  # Avoid issues with range when urls is less than _POOL_SIZE.
-  batch_size = max(batch_size, len(urls_and_filepaths))
+  pool_size = max(1, concurrency.POOL_SIZE)
+  # Use ceiling division so URLs are partitioned evenly across pool workers
+  # and batch_size is always >= 1 when len(urls_and_filepaths) < pool_size.
+  batch_size = (len(urls_and_filepaths) + pool_size - 1) // pool_size
 
   for idx in range(0, len(urls_and_filepaths), batch_size):
     batch = urls_and_filepaths[idx:idx + batch_size]
@@ -109,12 +110,16 @@ async def delete_blob_async(bucket_name: str, blob_name: str, session,
 
   try:
     async with session.delete(url, headers=headers) as response:
-      if response.status != 204:
-        response_text = await response.text()
+      if response.status == 204:
+        return
+      response_text = await response.text()
+      if response.status == 404:
+        logs.info(f'Not found: {blob_name} {response_text}.')
+      else:
         logs.error(f'Failed to delete blob {blob_name}. Status code + resp: '
                    f'{response.status} {response_text}.')
   except google.api_core.exceptions.NotFound:
-    logs.info(f'Not found: {blob_name} {response_text}.')
+    logs.info(f'Not found: {blob_name}.')
   except Exception as e:
     logs.error(f'Couldn\'t delete {blob_name}: {e}.')
 
