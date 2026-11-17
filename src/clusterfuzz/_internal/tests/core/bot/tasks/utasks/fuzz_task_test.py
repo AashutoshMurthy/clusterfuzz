@@ -2042,6 +2042,62 @@ class DoBlackboxFuzzingDeferredLoggingTest(fake_filesystem_unittest.TestCase):
     self.assertEqual(b'output_trace',
                      session.fuzz_task_output.fuzzer_run_outputs[0].output)
 
+  def test_do_blackbox_fuzzing_stops_early_at_proto_limit_unmocked(self):
+    """Verify do_blackbox_fuzzing stops early once run outputs fill the proto,
+    without mocking _is_fuzz_task_output_limit_exceeded."""
+    helpers.patch(self, [
+        'clusterfuzz._internal.bot.tasks.trials.Trials',
+        'clusterfuzz._internal.build_management.revisions.get_component_list',
+        'clusterfuzz._internal.bot.testcase_manager.run_testcase_and_return_result_in_queue',
+        'clusterfuzz._internal.system.process_handler.close_queue',
+        'clusterfuzz._internal.system.process_handler.get_process',
+        'clusterfuzz._internal.system.process_handler.get_queue',
+        'clusterfuzz._internal.system.process_handler.terminate_hung_threads',
+        'clusterfuzz._internal.system.process_handler.'
+        'terminate_stale_application_instances',
+    ])
+    os.environ['JOB_NAME'] = 'asan_test'
+    os.environ['MAX_FUZZ_THREADS'] = '1'
+    os.environ['THREAD_DELAY'] = '0.001'
+    os.environ['THREAD_ALIVE_CHECK_INTERVAL'] = '0.001'
+
+    testcase_file_paths = [f'/tests/{i}' for i in range(8)]
+    for testcase_file_path in testcase_file_paths:
+      self.fs.create_file(testcase_file_path, contents='testcase')
+
+    def mock_run_testcase(crash_queue, *_unused_args, **_unused_kwargs):
+      crash_queue.put(
+          testcase_manager.TestcaseRunResult(
+              fuzzer_run_output_data=testcase_manager.FuzzerRunOutputData.
+              from_memory(
+                  output=b'o' * 300, log_time=datetime.datetime(2026, 7, 10))))
+
+    self.mock.run_testcase_and_return_result_in_queue.side_effect = (
+        mock_run_testcase)
+    self.mock.get_queue.side_effect = queue.Queue
+    mock_thread_cls = mock.MagicMock(wraps=threading.Thread)
+    self.mock.get_process.return_value = mock_thread_cls
+
+    uworker_input = uworker_msg_pb2.Input(
+        fuzzer_name='fantasy_fuzz',
+        job_type='asan_test',
+        fuzz_task_input=uworker_msg_pb2.FuzzTaskInput())
+    session = fuzz_task.FuzzingSession(uworker_input, 10)
+    session.generate_blackbox_testcases = mock.MagicMock(
+        return_value=fuzz_task.GenerateBlackboxTestcasesResult(
+            True, testcase_file_paths, {'fuzzer_binary_name': 'fantasy_fuzz'}))
+
+    # One testcase runs per batch and each run output is roughly 320 bytes on
+    # the wire, so a 1000 byte limit is hit on the 4th of the 8 testcases.
+    with mock.patch.object(fuzz_task, 'PROTOBUF_MSG_LIMIT', 1000):
+      session.do_blackbox_fuzzing(
+          data_types.Fuzzer(name='fantasy_fuzz'), '/fake-fuzz-dir', 'asan_test')
+      self.assertTrue(session._is_fuzz_task_output_limit_exceeded())
+
+    self.assertEqual(4, mock_thread_cls.call_count)
+    self.assertEqual(3, len(session.fuzz_task_output.fuzzer_run_outputs))
+    self.assertLess(session.fuzz_task_output.ByteSize(), 1000)
+
 
 class FuzzTaskOutputLimitTest(fake_filesystem_unittest.TestCase):
   """Unit tests for fuzz task output limit checks and unexecuted testcase cleanup."""
@@ -2171,6 +2227,20 @@ class FuzzTaskOutputLimitTest(fake_filesystem_unittest.TestCase):
 
     self.assertEqual([crash], crashes)
     self.assertEqual(0, len(session.fuzz_task_output.fuzzer_run_outputs))
+    self.assertFalse(os.path.exists('/tmp/trace.log'))
+
+  def test_incremental_size_tracking_prevents_overshoot(self):
+    """Verify _append_fuzzer_run_output tracks size incrementally without
+    exceeding PROTOBUF_MSG_LIMIT."""
+    session = self._create_session()
+    with mock.patch.object(fuzz_task, 'PROTOBUF_MSG_LIMIT', 100):
+      small = uworker_msg_pb2.FuzzerRunOutput(output=b'a' * 40, return_code=0)
+      large = uworker_msg_pb2.FuzzerRunOutput(output=b'b' * 70, return_code=0)
+      session._append_fuzzer_run_output(small)
+      session._append_fuzzer_run_output(large)
+      self.assertEqual(1, len(session.fuzz_task_output.fuzzer_run_outputs))
+      self.assertLess(session.fuzz_task_output.ByteSize(), 100)
+      self.assertTrue(session._is_fuzz_task_output_limit_exceeded())
 
 
 @test_utils.with_cloud_emulators('datastore')
@@ -2478,6 +2548,23 @@ class DoEngineFuzzingTest(fake_filesystem_unittest.TestCase):
       }, testcase_run)
       # TODO(metzman): We need a test for fuzzing end to end with
       # preprocess/main/postprocess.
+    self.assertEqual(2, len(session.fuzz_task_output.fuzzer_run_outputs))
+
+  def test_skips_fuzzer_run_outputs_without_fuzz_logs_bucket(self):
+    """Verify do_engine_fuzzing skips packing fuzzer_run_outputs when
+    FUZZ_LOGS_BUCKET is unset."""
+    session = self._create_engine_fuzzing_session()
+    environment.remove_key('FUZZ_LOGS_BUCKET')
+    expected_crashes = [engine.Crash('/input', 'stack', ['args'], 1.0)]
+    engine_impl = self._create_engine_impl()
+    engine_impl.fuzz.side_effect = lambda *_: engine.FuzzResult(
+        'logs', ['cmd'], expected_crashes, {'stat': 1}, 42.0)
+
+    crashes, _ = session.do_engine_fuzzing(engine_impl)
+
+    self.assertEqual(2, len(crashes))
+    self.assertEqual(2, len(session.fuzz_task_output.testcase_run_jsons))
+    self.assertEqual(0, len(session.fuzz_task_output.fuzzer_run_outputs))
 
   def _get_parse_crash_dist(self, success):
     return monitoring_metrics.FUZZ_TASK_STEPS_DURATION.get({
@@ -2549,6 +2636,90 @@ class DoEngineFuzzingTest(fake_filesystem_unittest.TestCase):
     # The task stops at the first failing round.
     self.assertEqual(1, self._get_parse_crash_dist(success=False).count)
     self.assertEqual(0, self._get_parse_crash_dist(success=True).count)
+
+
+class PostprocessFuzzerRunOutputsTest(unittest.TestCase):
+  """Unit tests for deferred fuzzer_run_outputs upload in _utask_postprocess."""
+
+  def setUp(self):
+    helpers.patch_environ(self)
+    helpers.patch(self, [
+        'clusterfuzz._internal.bot.tasks.utasks.fuzz_task._make_session',
+        'clusterfuzz._internal.bot.testcase_manager.upload_log',
+        'clusterfuzz._internal.bot.testcase_manager.upload_testcase',
+        'clusterfuzz._internal.build_management.revisions.get_component_list',
+    ])
+    self.mock._make_session.return_value = mock.MagicMock()
+    self.mock.get_component_list.return_value = [{
+        'component': 'component',
+        'link_text': 'rev',
+    }]
+
+  def _create_output(self, num_outputs):
+    return uworker_msg_pb2.Output(
+        uworker_input=uworker_msg_pb2.Input(
+            fuzzer_name='libFuzzer', job_type='libfuzzer_asan_test'),
+        fuzz_task_output=uworker_msg_pb2.FuzzTaskOutput(
+            fully_qualified_fuzzer_name='libFuzzer_test_target',
+            fuzzer_run_outputs=[
+                uworker_msg_pb2.FuzzerRunOutput(
+                    output=f'out{i}'.encode(), return_code=i % 2)
+                for i in range(num_outputs)
+            ]))
+
+  def test_postprocess_skips_when_bucket_unset(self):
+    """Verify _utask_postprocess skips header lookup and uploads when
+    FUZZ_LOGS_BUCKET is unset."""
+    output = self._create_output(2)
+    environment.remove_key('FUZZ_LOGS_BUCKET')
+
+    fuzz_task._utask_postprocess(output)
+
+    self.mock.upload_log.assert_not_called()
+    self.mock.upload_testcase.assert_not_called()
+    self.mock.get_component_list.assert_not_called()
+
+  def test_postprocess_uploads_sequentially_for_small_batch(self):
+    """Verify _utask_postprocess computes and forwards header_prefix once
+    without spinning up a thread pool for small batches."""
+    count = fuzz_task.LOG_UPLOAD_POOL_THRESHOLD
+    output = self._create_output(count)
+    os.environ['FUZZ_LOGS_BUCKET'] = 'fake-logs-bucket'
+    os.environ['APP_REVISION'] = '100'
+    os.environ['BOT_NAME'] = 'bot-1'
+
+    with mock.patch.object(fuzz_task.futures,
+                           'ThreadPoolExecutor') as mock_executor:
+      fuzz_task._utask_postprocess(output)
+
+    mock_executor.assert_not_called()
+    self.assertEqual(1, self.mock.get_component_list.call_count)
+    self.assertEqual(count, self.mock.upload_log.call_count)
+    self.assertEqual(count, self.mock.upload_testcase.call_count)
+    for call in self.mock.upload_log.call_args_list:
+      self.assertIn('Bot name: bot-1', call.kwargs['header_prefix'])
+
+  def test_postprocess_uploads_concurrently_for_large_batch(self):
+    """Verify _utask_postprocess computes header_prefix once and uploads
+    concurrently when outputs exceed LOG_UPLOAD_POOL_THRESHOLD."""
+    count = fuzz_task.LOG_UPLOAD_POOL_THRESHOLD + 1
+    output = self._create_output(count)
+    os.environ['FUZZ_LOGS_BUCKET'] = 'fake-logs-bucket'
+    os.environ['APP_REVISION'] = '100'
+    os.environ['BOT_NAME'] = 'bot-1'
+
+    with mock.patch.object(
+        fuzz_task.futures,
+        'ThreadPoolExecutor',
+        wraps=fuzz_task.futures.ThreadPoolExecutor) as mock_executor:
+      fuzz_task._utask_postprocess(output)
+
+    mock_executor.assert_called_once_with(max_workers=count)
+    self.assertEqual(1, self.mock.get_component_list.call_count)
+    self.assertEqual(count, self.mock.upload_log.call_count)
+    self.assertEqual(count, self.mock.upload_testcase.call_count)
+    for call in self.mock.upload_log.call_args_list:
+      self.assertIn('Bot name: bot-1', call.kwargs['header_prefix'])
 
 
 class UntrustedRunEngineFuzzerTest(
