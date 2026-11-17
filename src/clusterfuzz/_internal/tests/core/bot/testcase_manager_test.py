@@ -235,6 +235,13 @@ class UploadTestcaseOutputTest(fake_filesystem_unittest.TestCase):
         b'Return code: 1\n\nfake output',
         'gs://fake-gcs-logs/fuzzer/job/2016-09-02/19:59:01:017923.log')
 
+  def test_upload_skips_prepare_when_bucket_unset(self):
+    """upload_log should skip revision lookup when FUZZ_LOGS_BUCKET is unset."""
+    environment.remove_key('FUZZ_LOGS_BUCKET')
+    testcase_manager.upload_log('fake output', 0, datetime.datetime(2026, 7, 1))
+    self.mock.get_component_range_list.assert_not_called()
+    self.mock.write_data.assert_not_called()
+
 
 class ConvertDependencyUrlToLocalPathTest(unittest.TestCase):
   """Tests convert_dependency_url_to_local_path."""
@@ -977,6 +984,7 @@ class RunTestcaseAndReturnResultInQueueTest(fake_filesystem_unittest.TestCase):
     os.environ['FAIL_RETRIES'] = '1'
     os.environ['FAIL_WAIT'] = '1'
     os.environ['BOT_TMPDIR'] = '/bot_tmp'
+    os.environ['FUZZ_LOGS_BUCKET'] = 'fake-gcs-logs'
     self.fs.create_dir('/crashes')
     self.fs.create_dir('/root/bot/logs')
     self.fs.create_dir('/bot_tmp')
@@ -1057,6 +1065,56 @@ class RunTestcaseAndReturnResultInQueueTest(fake_filesystem_unittest.TestCase):
         datetime.datetime(2026, 7, 10), fuzzer_run_output_data.log_time)
     self.assertEqual(0, self.mock.upload_testcase.call_count)
     self.assertEqual(0, self.mock.upload_log.call_count)
+
+  def test_run_no_crash_without_fuzz_logs_bucket(self):
+    """Verify non-crashing runs skip log file creation and queueing when
+    FUZZ_LOGS_BUCKET is unset."""
+    environment.remove_key('FUZZ_LOGS_BUCKET')
+    crash_queue = queue.Queue()
+    self.mock.run_testcase.return_value = (0, 1.5, 'raw_output_trace')
+    self.mock.is_crash.return_value = False
+
+    testcase_manager.run_testcase_and_return_result_in_queue(
+        crash_queue=crash_queue,
+        thread_index=0,
+        file_path='/testcase',
+        gestures=[],
+        env_copy={})
+
+    self.assertEqual(0, self.mock.error.call_count)
+    self.assertTrue(crash_queue.empty())
+    self.mock._get_testcase_time.assert_not_called()
+    self.mock.get_crash_data.assert_not_called()
+    self.assertEqual([], os.listdir('/bot_tmp'))
+
+  def test_run_with_crash_without_fuzz_logs_bucket(self):
+    """Verify crashing runs still queue the crash without staging fuzzer logs
+    when FUZZ_LOGS_BUCKET is unset."""
+    environment.remove_key('FUZZ_LOGS_BUCKET')
+    crash_queue = queue.Queue()
+    self.mock.run_testcase.return_value = (1, 2.0, 'raw_crash_trace')
+    self.mock.is_crash.return_value = True
+    mock_unsymbolized_info = mock.MagicMock()
+    mock_unsymbolized_info.crash_state = 'frame1\n'
+    self.mock.get_crash_data.return_value = mock_unsymbolized_info
+
+    testcase_manager.run_testcase_and_return_result_in_queue(
+        crash_queue=crash_queue,
+        thread_index=0,
+        file_path='/testcase',
+        gestures=[],
+        env_copy={})
+
+    self.assertEqual(0, self.mock.error.call_count)
+    self.assertFalse(crash_queue.empty())
+    result = crash_queue.get()
+    self.assertIsNotNone(result.crash)
+    self.assertEqual('/testcase', result.crash.file_path)
+    self.assertIsNone(result.fuzzer_run_output_data)
+    self.mock._get_testcase_time.assert_not_called()
+    self.mock.get_crash_data.assert_called_once_with(
+        'raw_crash_trace', symbolize_flag=False)
+    self.assertEqual([], os.listdir('/bot_tmp'))
 
 
 def _get_fuzz_target_from_preprocess(testcase):

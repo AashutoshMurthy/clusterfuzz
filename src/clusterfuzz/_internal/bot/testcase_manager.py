@@ -423,6 +423,12 @@ class FuzzerRunOutputData:
 
     return self._output
 
+  def cleanup(self) -> None:
+    """Removes any temporary backing file without reading its contents."""
+    if self._file_path:
+      shell.remove_file(self._file_path)
+      self._file_path = None
+
 
 @dataclasses.dataclass
 class TestcaseRunResult:
@@ -573,10 +579,6 @@ def _do_run_testcase_and_return_result_in_queue(
     crash_output = _get_crash_output(output)
     crash_result = CrashResult(return_code, crash_time, crash_output)
 
-    # To provide consistency between stats and logs, we use timestamp taken
-    # from stats when uploading logs and testcase.
-    log_time = _get_testcase_time(file_path)
-
     crash = None
     if crash_result.is_crash():
       # Initialize resource list with the testcase path.
@@ -598,23 +600,34 @@ def _do_run_testcase_and_return_result_in_queue(
           gestures=gestures,
           stack_file_path=stack_file_path)
 
-    # Save raw, unsymbolized execution output for deferred postprocessing.
-    crash_result_full = CrashResult(return_code, crash_time, output)
-    unsymbolized_output = crash_result_full.get_stacktrace()
-    crash_path = file_path if crash else None
-    log_file_path = utils.create_temp_file(
-        directory=environment.get_value('BOT_TMPDIR'),
-        prefix='fuzzer_output_',
-        suffix='.log')
-    utils.write_data_to_file(unsymbolized_output, log_file_path)
-    fuzzer_run_output_data = FuzzerRunOutputData.from_file_path(
-        file_path=log_file_path,
-        crash_path=crash_path,
-        return_code=return_code,
-        log_time=log_time)
-    crash_queue.put(
-        TestcaseRunResult(
-            crash=crash, fuzzer_run_output_data=fuzzer_run_output_data))
+    should_upload_output = bool(
+        environment.get_value('FUZZ_LOGS_BUCKET', env=env_copy) or
+        environment.get_value('FUZZ_LOGS_BUCKET'))
+    fuzzer_run_output_data = None
+    if should_upload_output:
+      # To provide consistency between stats and logs, we use timestamp taken
+      # from stats when uploading logs and testcase.
+      log_time = _get_testcase_time(file_path)
+
+      # Save execution output for deferred postprocessing.
+      crash_result_full = CrashResult(return_code, crash_time, output)
+      symbolized_output = crash_result_full.get_stacktrace()
+      crash_path = file_path if crash else None
+      log_file_path = utils.create_temp_file(
+          directory=environment.get_value('BOT_TMPDIR'),
+          prefix='fuzzer_output_',
+          suffix='.log')
+      utils.write_data_to_file(symbolized_output, log_file_path)
+      fuzzer_run_output_data = FuzzerRunOutputData.from_file_path(
+          file_path=log_file_path,
+          crash_path=crash_path,
+          return_code=return_code,
+          log_time=log_time)
+
+    if crash or fuzzer_run_output_data:
+      crash_queue.put(
+          TestcaseRunResult(
+              crash=crash, fuzzer_run_output_data=fuzzer_run_output_data))
   except Exception as e:
     logs.error(
         'Exception occurred while running '
@@ -931,9 +944,8 @@ def test_for_reproducibility(fuzz_target,
                                            expected_security_flag)
 
 
-def _prepare_log_for_upload(symbolized_output, return_code, app_revision):
-  """Prepare log for upload."""
-  # Add revision information to the logs.
+def get_log_header_prefix(app_revision=None) -> str:
+  """Returns the shared component-revisions and bot header for log uploads."""
   app_revision = app_revision or environment.get_value('APP_REVISION')
   job_name = environment.get_value('JOB_NAME')
   components = revisions.get_component_list(app_revision, job_name)
@@ -941,18 +953,27 @@ def _prepare_log_for_upload(symbolized_output, return_code, app_revision):
       revisions.format_revision_list(components, use_html=False) or
       'Not available.\n')
 
-  revisions_header =\
-  f'Component revisions (build r{app_revision}):\n{component_revisions}\n'
+  revisions_header = (
+      f'Component revisions (build r{app_revision}):\n{component_revisions}\n')
 
   bot_name = environment.get_value('BOT_NAME')
   bot_header = f'Bot name: {bot_name}\n'
   if environment.is_android():
     bot_header += f'Device serial: {environment.get_value("ANDROID_SERIAL")}\n'
 
-  return_code_header = f'Return code: {return_code}\n\n'
+  return revisions_header + bot_header
 
-  result = (
-      revisions_header + bot_header + return_code_header + symbolized_output)
+
+def _prepare_log_for_upload(symbolized_output,
+                            return_code,
+                            app_revision,
+                            header_prefix=None):
+  """Prepare log for upload."""
+  if header_prefix is None:
+    header_prefix = get_log_header_prefix(app_revision=app_revision)
+
+  return_code_header = f'Return code: {return_code}\n\n'
+  result = header_prefix + return_code_header + symbolized_output
   return result.encode('utf-8')
 
 
@@ -960,13 +981,15 @@ def upload_log(symbolized_output,
                return_code,
                log_time,
                app_revision=None,
-               fuzzer_name=None):
+               fuzzer_name=None,
+               header_prefix=None):
   """Upload the output into corresponding GCS logs bucket."""
-  log = _prepare_log_for_upload(symbolized_output, return_code, app_revision)
   fuzz_logs_bucket = environment.get_value('FUZZ_LOGS_BUCKET')
   if not fuzz_logs_bucket:
     return
 
+  log = _prepare_log_for_upload(
+      symbolized_output, return_code, app_revision, header_prefix=header_prefix)
   fuzzer_logs.upload_to_logs(
       fuzz_logs_bucket, log, time=log_time, fuzzer_name=fuzzer_name)
 

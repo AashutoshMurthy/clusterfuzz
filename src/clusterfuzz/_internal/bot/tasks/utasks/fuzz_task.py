@@ -14,6 +14,7 @@
 """Fuzz task for handling fuzzing."""
 
 import collections
+from concurrent import futures
 import datetime
 import enum
 import itertools
@@ -88,6 +89,7 @@ THREAD_WAIT_TIMEOUT = 1
 MAX_CRASHES_UPLOADED = 64
 
 ENGINE_OUTPUT_LIMIT = 10 * 2**20
+LOG_UPLOAD_THREADS = 16
 
 
 class FuzzTaskError(Exception):
@@ -1571,6 +1573,8 @@ class FuzzingSession:
 
     self.gcs_corpus = None
     self.fuzz_task_output = uworker_msg_pb2.FuzzTaskOutput()  # pylint: disable=no-member
+    self._fuzz_task_output_base_bytes = None
+    self._fuzzer_run_outputs_bytes = 0
     self.steps_time_tracker = monitor.TimeStatTracker(
         monitoring_metrics.FUZZ_TASK_STEPS_DURATION,
         common_labels={
@@ -1833,27 +1837,29 @@ class FuzzingSession:
       # Upload logs, testcases (if there are crashes), and stats.
       # Use a consistent log time to allow correlating between logs, uploaded
       # testcases, and stats.
-      log_time = datetime.datetime.utcfromtimestamp(
-          float(testcase_run.timestamp))
-      crash_result_obj = crash_result.CrashResult(
-          return_code, result.time_executed, result.logs)
-      output = crash_result_obj.get_stacktrace()
-      # TODO(metzman): Consider uploading this with a signed URL.
-      if result.crashes:
-        # We only upload the first, because they will clobber each other if we
-        # upload more.
-        result_crash = result.crashes[0].input_path
-      else:
-        result_crash = None
+      if environment.get_value('FUZZ_LOGS_BUCKET'):
+        log_time = datetime.datetime.utcfromtimestamp(
+            float(testcase_run.timestamp))
+        crash_result_obj = crash_result.CrashResult(
+            return_code, result.time_executed, result.logs)
+        output = crash_result_obj.get_stacktrace()
+        # TODO(metzman): Consider uploading this with a signed URL.
+        if result.crashes:
+          # We only upload the first, because they will clobber each other if we
+          # upload more.
+          result_crash = result.crashes[0].input_path
+        else:
+          result_crash = None
 
-      fuzzer_run_output_data = testcase_manager.FuzzerRunOutputData.from_memory(
-          output=output,
-          crash_path=result_crash,
-          return_code=return_code,
-          log_time=log_time)
-      fuzzer_run_output = _to_fuzzer_run_output(fuzzer_run_output_data)
-      if fuzzer_run_output:
-        self.fuzz_task_output.fuzzer_run_outputs.append(fuzzer_run_output)
+        fuzzer_run_output_data = (
+            testcase_manager.FuzzerRunOutputData.from_memory(
+                output=output,
+                crash_path=result_crash,
+                return_code=return_code,
+                log_time=log_time))
+        fuzzer_run_output = _to_fuzzer_run_output(fuzzer_run_output_data)
+        if fuzzer_run_output:
+          self._append_fuzzer_run_output(fuzzer_run_output)
 
       add_additional_testcase_run_data(testcase_run,
                                        self.fuzz_target.fully_qualified_name(),
@@ -1889,13 +1895,32 @@ class FuzzingSession:
               'platform': environment.platform(),
           })
 
-  def _is_fuzz_task_output_limit_exceeded(self) -> bool:
+  def _is_fuzz_task_output_limit_exceeded(self,
+                                          additional_bytes: int = 0) -> bool:
     """Checks if the fuzz_task_output protobuf message exceeds the size limit.
+
+    Args:
+      additional_bytes: Additional wire bytes to be appended.
 
     Returns:
       True if fuzz_task_output exceeds PROTOBUF_MSG_LIMIT, False otherwise.
     """
-    return self.fuzz_task_output.ByteSize() >= PROTOBUF_MSG_LIMIT
+    if self._fuzz_task_output_base_bytes is None:
+      self._fuzz_task_output_base_bytes = self.fuzz_task_output.ByteSize()
+    return (self._fuzz_task_output_base_bytes + self._fuzzer_run_outputs_bytes +
+            additional_bytes) >= PROTOBUF_MSG_LIMIT
+
+  def _append_fuzzer_run_output(
+      self, fuzzer_run_output: uworker_msg_pb2.FuzzerRunOutput) -> None:
+    """Appends |fuzzer_run_output| if within PROTOBUF_MSG_LIMIT."""
+    if self._is_fuzz_task_output_limit_exceeded():
+      return
+    # Account for repeated field tag (2 bytes for field 16) + varint length
+    # prefix (up to 4 bytes for payloads < 256 MB).
+    entry_bytes = fuzzer_run_output.ByteSize() + 6
+    if not self._is_fuzz_task_output_limit_exceeded(entry_bytes):
+      self.fuzz_task_output.fuzzer_run_outputs.append(fuzzer_run_output)
+      self._fuzzer_run_outputs_bytes += entry_bytes
 
   def _handle_unexecuted_testcases(
       self, testcase_file_paths: list[str], testcases_metadata: dict[str, dict],
@@ -1937,9 +1962,12 @@ class FuzzingSession:
       if result.crash:
         crashes.append(result.crash)
       if result.fuzzer_run_output_data:
+        if self._is_fuzz_task_output_limit_exceeded():
+          result.fuzzer_run_output_data.cleanup()
+          continue
         fuzzer_run_output = _to_fuzzer_run_output(result.fuzzer_run_output_data)
-        if fuzzer_run_output and not self._is_fuzz_task_output_limit_exceeded():
-          self.fuzz_task_output.fuzzer_run_outputs.append(fuzzer_run_output)
+        if fuzzer_run_output:
+          self._append_fuzzer_run_output(fuzzer_run_output)
 
   def do_blackbox_fuzzing(self, fuzzer, fuzzer_directory, job_type):
     """Run blackbox fuzzing. Currently also used for engine fuzzing."""
@@ -2584,14 +2612,18 @@ def _add_build_metadata_to_output(
   fuzz_task_output.gn_args = data_handler.get_filtered_gn_args() or ''
 
 
-def _upload_fuzzer_run_output(fuzzer_run_output, fuzzer_name):
+def _upload_fuzzer_run_output(fuzzer_run_output,
+                              fuzzer_name,
+                              header_prefix=None):
+  """Uploads a single deferred fuzzer run log and optional crash testcase."""
   timestamp = uworker_io.proto_timestamp_to_timestamp(
       fuzzer_run_output.timestamp)
   testcase_manager.upload_log(
       fuzzer_run_output.output.decode(),
       fuzzer_run_output.return_code,
       timestamp,
-      fuzzer_name=fuzzer_name)
+      fuzzer_name=fuzzer_name,
+      header_prefix=header_prefix)
   testcase_manager.upload_testcase(
       None, fuzzer_run_output.testcase, timestamp, fuzzer_name=fuzzer_name)
 
@@ -2610,9 +2642,21 @@ def _utask_postprocess(output):
   session.postprocess(output)
   # TODO(b/374776013): Refactor this code so the uploads happen during
   # utask_main.
-  fuzzer_name = output.fuzz_task_output.fully_qualified_fuzzer_name
-  for fuzzer_run_output in output.fuzz_task_output.fuzzer_run_outputs:
-    _upload_fuzzer_run_output(fuzzer_run_output, fuzzer_name)
+  fuzzer_run_outputs = output.fuzz_task_output.fuzzer_run_outputs
+  if fuzzer_run_outputs and environment.get_value('FUZZ_LOGS_BUCKET'):
+    fuzzer_name = output.fuzz_task_output.fully_qualified_fuzzer_name
+    header_prefix = testcase_manager.get_log_header_prefix()
+    if len(fuzzer_run_outputs) == 1:
+      _upload_fuzzer_run_output(
+          fuzzer_run_outputs[0], fuzzer_name, header_prefix=header_prefix)
+    else:
+      max_workers = min(LOG_UPLOAD_THREADS, len(fuzzer_run_outputs))
+      with futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+        list(
+            executor.map(
+                lambda run_output: _upload_fuzzer_run_output(
+                    run_output, fuzzer_name, header_prefix=header_prefix),
+                fuzzer_run_outputs))
 
 
 def utask_postprocess(output):
